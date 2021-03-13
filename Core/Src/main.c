@@ -1,21 +1,18 @@
 /* USER CODE BEGIN Header */
 /**
-  ******************************************************************************
-  * @file           : main.c
-  * @brief          : Main program body
-  ******************************************************************************
-  * @attention
-  *
-  * <h2><center>&copy; Copyright (c) 2021 STMicroelectronics.
-  * All rights reserved.</center></h2>
-  *
-  * This software component is licensed by ST under BSD 3-Clause license,
-  * the "License"; You may not use this file except in compliance with the
-  * License. You may obtain a copy of the License at:
-  *                        opensource.org/licenses/BSD-3-Clause
-  *
-  ******************************************************************************
-  */
+ * @file main.c
+ * 
+ * Demonstration of operation of an STM32 ADC.
+ * 
+ * This version uses a timer to trigger an ADC "scan" conversion of three
+ * channels at a fixed rate. On each trigger, the 3 readings are taken as fast
+ * as the ADC itself is set to perform the conversions and these are transferred
+ * into a single shared buffer by the DMA. The buffer looks like
+ * [ ch1read1, ch2read1, ch3read1, ch1read2, ch2read2, ch3read2, ...]
+ * 
+ * NOTE: The ADC must NOT be configured for continuous conversions when
+ * being triggered by a timer.
+ */
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
@@ -32,6 +29,9 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
+#define NUM_ANALOG_CHANNELS 3
+#define ADC_BUF_LENGTH_PER_CHANNEL 256
+#define ADC_BUF_LENGTH (ADC_BUF_LENGTH_PER_CHANNEL * NUM_ANALOG_CHANNELS)
 #define TEMP_SLOPE 0.0043 // V / degC
 #define VOLT_25DEG 1.38 // V
 /* USER CODE END PD */
@@ -43,19 +43,26 @@
 
 /* Private variables ---------------------------------------------------------*/
 ADC_HandleTypeDef hadc1;
+DMA_HandleTypeDef hdma_adc1;
+
+TIM_HandleTypeDef htim4;
 
 UART_HandleTypeDef huart2;
 
 /* USER CODE BEGIN PV */
-
+volatile uint16_t adc_buf[ADC_BUF_LENGTH] = {0};
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
+static void MX_DMA_Init(void);
 static void MX_ADC1_Init(void);
 static void MX_USART2_UART_Init(void);
+static void MX_TIM4_Init(void);
 /* USER CODE BEGIN PFP */
+void processReadings(int half, float result[]);
+float convert_temp(float raw_adc_reading);
 
 /* USER CODE END PFP */
 
@@ -71,9 +78,7 @@ static void MX_USART2_UART_Init(void);
 int main(void)
 {
   /* USER CODE BEGIN 1 */
-  u_int16_t raw_adc_reading = 0;
-  float voltage = 0.0;
-  float temperature = 0.0;
+
   /* USER CODE END 1 */
 
   /* MCU Configuration--------------------------------------------------------*/
@@ -82,6 +87,8 @@ int main(void)
   HAL_Init();
 
   /* USER CODE BEGIN Init */
+
+  __HAL_DBGMCU_FREEZE_TIM4(); // Pause timer 4 on debug
 
   /* USER CODE END Init */
 
@@ -94,27 +101,22 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
+  MX_DMA_Init();
   MX_ADC1_Init();
   MX_USART2_UART_Init();
+  MX_TIM4_Init();
   /* USER CODE BEGIN 2 */
-  HAL_ADC_Start(&hadc1);
+  HAL_TIM_PWM_Start(&htim4, TIM_CHANNEL_4);
+  HAL_ADC_Start_DMA(&hadc1, (uint32_t *) adc_buf, ADC_BUF_LENGTH);
   printf("ADC started\n");
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   while (1)
-  {
-    HAL_ADC_PollForConversion(&hadc1, HAL_MAX_DELAY);
-    raw_adc_reading = HAL_ADC_GetValue(&hadc1);
-
-    voltage = ((float) raw_adc_reading) * 3.3 / 4095;
-    temperature = ((voltage - VOLT_25DEG) / TEMP_SLOPE) + 25.0;
-
-    printf("ADC=%u V=%.3f T=%.2f\n", raw_adc_reading, voltage, temperature);
-    
+  { 
     HAL_GPIO_TogglePin(LD2_GPIO_Port, LD2_Pin);
-    HAL_Delay(250);
+    HAL_Delay(500);
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
@@ -186,12 +188,12 @@ static void MX_ADC1_Init(void)
   /** Common config
   */
   hadc1.Instance = ADC1;
-  hadc1.Init.ScanConvMode = ADC_SCAN_DISABLE;
-  hadc1.Init.ContinuousConvMode = ENABLE;
+  hadc1.Init.ScanConvMode = ADC_SCAN_ENABLE;
+  hadc1.Init.ContinuousConvMode = DISABLE;
   hadc1.Init.DiscontinuousConvMode = DISABLE;
-  hadc1.Init.ExternalTrigConv = ADC_SOFTWARE_START;
+  hadc1.Init.ExternalTrigConv = ADC_EXTERNALTRIGCONV_T4_CC4;
   hadc1.Init.DataAlign = ADC_DATAALIGN_RIGHT;
-  hadc1.Init.NbrOfConversion = 1;
+  hadc1.Init.NbrOfConversion = 3;
   if (HAL_ADC_Init(&hadc1) != HAL_OK)
   {
     Error_Handler();
@@ -205,9 +207,75 @@ static void MX_ADC1_Init(void)
   {
     Error_Handler();
   }
+  /** Configure Regular Channel
+  */
+  sConfig.Channel = ADC_CHANNEL_0;
+  sConfig.Rank = ADC_REGULAR_RANK_2;
+  sConfig.SamplingTime = ADC_SAMPLETIME_7CYCLES_5;
+  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /** Configure Regular Channel
+  */
+  sConfig.Channel = ADC_CHANNEL_1;
+  sConfig.Rank = ADC_REGULAR_RANK_3;
+  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
   /* USER CODE BEGIN ADC1_Init 2 */
 
   /* USER CODE END ADC1_Init 2 */
+
+}
+
+/**
+  * @brief TIM4 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM4_Init(void)
+{
+
+  /* USER CODE BEGIN TIM4_Init 0 */
+
+  /* USER CODE END TIM4_Init 0 */
+
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+  TIM_OC_InitTypeDef sConfigOC = {0};
+
+  /* USER CODE BEGIN TIM4_Init 1 */
+
+  /* USER CODE END TIM4_Init 1 */
+  htim4.Instance = TIM4;
+  htim4.Init.Prescaler = 4999;
+  htim4.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim4.Init.Period = 99;
+  htim4.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim4.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_PWM_Init(&htim4) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim4, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sConfigOC.OCMode = TIM_OCMODE_PWM1;
+  sConfigOC.Pulse = 50;
+  sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
+  sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
+  if (HAL_TIM_PWM_ConfigChannel(&htim4, &sConfigOC, TIM_CHANNEL_4) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM4_Init 2 */
+
+  /* USER CODE END TIM4_Init 2 */
+  HAL_TIM_MspPostInit(&htim4);
 
 }
 
@@ -245,6 +313,22 @@ static void MX_USART2_UART_Init(void)
 }
 
 /**
+  * Enable DMA controller clock
+  */
+static void MX_DMA_Init(void)
+{
+
+  /* DMA controller clock enable */
+  __HAL_RCC_DMA1_CLK_ENABLE();
+
+  /* DMA interrupt init */
+  /* DMA1_Channel1_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA1_Channel1_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(DMA1_Channel1_IRQn);
+
+}
+
+/**
   * @brief GPIO Initialization Function
   * @param None
   * @retval None
@@ -260,7 +344,7 @@ static void MX_GPIO_Init(void)
   __HAL_RCC_GPIOB_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(LD2_GPIO_Port, LD2_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOA, LD2_Pin|DEBUG0_Pin|DEBUG1_Pin, GPIO_PIN_RESET);
 
   /*Configure GPIO pin : B1_Pin */
   GPIO_InitStruct.Pin = B1_Pin;
@@ -268,20 +352,76 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(B1_GPIO_Port, &GPIO_InitStruct);
 
-  /*Configure GPIO pin : LD2_Pin */
-  GPIO_InitStruct.Pin = LD2_Pin;
+  /*Configure GPIO pins : LD2_Pin DEBUG0_Pin DEBUG1_Pin */
+  GPIO_InitStruct.Pin = LD2_Pin|DEBUG0_Pin|DEBUG1_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(LD2_GPIO_Port, &GPIO_InitStruct);
-
-  /* EXTI interrupt init*/
-  HAL_NVIC_SetPriority(EXTI15_10_IRQn, 0, 0);
-  HAL_NVIC_EnableIRQ(EXTI15_10_IRQn);
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
 }
 
 /* USER CODE BEGIN 4 */
+void HAL_ADC_ConvHalfCpltCallback(ADC_HandleTypeDef* hadc)
+{
+  static float result[NUM_ANALOG_CHANNELS] = {0.0};
+  HAL_GPIO_TogglePin(DEBUG0_GPIO_Port, DEBUG0_Pin);
+  processReadings(0, result);
+  convert_temp(result[0]);
+  printf(", %.2f, %.2f\n", result[1], result[2]);
+}
+
+void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef* hadc)
+{
+  static float result[NUM_ANALOG_CHANNELS] = {0.0};
+  HAL_GPIO_TogglePin(DEBUG1_GPIO_Port, DEBUG1_Pin);
+  processReadings(1, result);
+  convert_temp(result[0]);
+  printf(", %.2f, %.2f\n", result[1], result[2]);
+}
+
+void HAL_ADC_ErrorCallback(ADC_HandleTypeDef* hadc)
+{
+  printf("ADC ERROR\n");
+  while(1);
+}
+
+void processReadings(int half, float result[])
+{
+  int32_t sum[NUM_ANALOG_CHANNELS] = {0};
+  int sample_num = 0;
+  int limit = ADC_BUF_LENGTH_PER_CHANNEL >> 1; // divide by 2
+  if(half == 1) 
+  {
+    sample_num = ADC_BUF_LENGTH_PER_CHANNEL >> 1; 
+    limit = ADC_BUF_LENGTH_PER_CHANNEL;
+  }
+
+  // Average the samples
+  for(; sample_num < limit; sample_num++)
+  {
+    for(int channel = 0; channel < NUM_ANALOG_CHANNELS; channel++)
+    {
+      sum[channel] += adc_buf[NUM_ANALOG_CHANNELS * sample_num + channel];
+    }
+  }
+  
+  for(int channel = 0; channel < NUM_ANALOG_CHANNELS; channel++)
+  {
+    result[channel] = ((float) sum[channel]) / (ADC_BUF_LENGTH_PER_CHANNEL >> 1);
+  }
+
+  return;
+}
+
+float convert_temp(float raw_adc_reading)
+{
+  float voltage = raw_adc_reading * 3.3 / 4095;
+  float temperature = ((voltage - VOLT_25DEG) / TEMP_SLOPE) + 25.0;
+  printf("A=%.2f V=%.2f T=%.2f", raw_adc_reading, voltage, temperature);
+  return temperature;
+}
+
 // Configure where printf() and putchar() output goes
 int __io_putchar(int ch)
 {
