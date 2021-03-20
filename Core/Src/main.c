@@ -12,6 +12,19 @@
  * 
  * NOTE: The ADC must NOT be configured for continuous conversions when
  * being triggered by a timer.
+ * 
+ * When the DMA has filled the first half of the buffer, it raises an interrupt
+ * and HAL_ADC_ConvHalfCpltCallback() is called. Here the first half of the
+ * buffer is processed while the ADC and DMA continue to fill the 2nd half of
+ * the buffer.
+ * 
+ * When the DMA has finished filling the 2nd half of the buffer, it raises an
+ * interrupt again, the HAL_ADC_ConvCpltCallback() is called. Here the 2nd half
+ * of the buffer is processed. While that processing is happening, the DMA
+ * loops back to the beginning of the buffer and starts overwriting the previous
+ * readings in the first half (it is configured in circular mode).
+ * This way, the cycle can continue indefinitely.
+ * 
  */
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
@@ -62,7 +75,7 @@ static void MX_USART2_UART_Init(void);
 static void MX_TIM4_Init(void);
 /* USER CODE BEGIN PFP */
 void processReadings(int half, float result[]);
-float convert_temp(float raw_adc_reading);
+float convertTemp(float raw_adc_reading);
 
 /* USER CODE END PFP */
 
@@ -362,21 +375,26 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
+
+// Conversion half complete DMA interrupt callback
 void HAL_ADC_ConvHalfCpltCallback(ADC_HandleTypeDef* hadc)
 {
   static float result[NUM_ANALOG_CHANNELS] = {0.0};
   HAL_GPIO_TogglePin(DEBUG0_GPIO_Port, DEBUG0_Pin);
+  // Average 1st half of the buffer
   processReadings(0, result);
-  convert_temp(result[0]);
+  convertTemp(result[0]);
   printf(", %.2f, %.2f\n", result[1], result[2]);
 }
 
+// Conversion complete DMA interrupt callback
 void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef* hadc)
 {
   static float result[NUM_ANALOG_CHANNELS] = {0.0};
   HAL_GPIO_TogglePin(DEBUG1_GPIO_Port, DEBUG1_Pin);
+  // Average 2nd half of the buffer
   processReadings(1, result);
-  convert_temp(result[0]);
+  convertTemp(result[0]);
   printf(", %.2f, %.2f\n", result[1], result[2]);
 }
 
@@ -414,7 +432,7 @@ void processReadings(int half, float result[])
   return;
 }
 
-float convert_temp(float raw_adc_reading)
+float convertTemp(float raw_adc_reading)
 {
   float voltage = raw_adc_reading * 3.3 / 4095;
   float temperature = ((voltage - VOLT_25DEG) / TEMP_SLOPE) + 25.0;
